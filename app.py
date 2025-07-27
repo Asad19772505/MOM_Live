@@ -3,15 +3,18 @@ import json
 import tempfile
 import whisper
 import openai
+import numpy as np
+import wave
 import streamlit as st
 from dotenv import load_dotenv
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
+import av
 
-# Load OpenAI key
+# Load OpenAI API key
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Streamlit config
-st.set_page_config(page_title="Zoom/Live Action Item Summarizer", layout="centered")
+st.set_page_config(page_title="Zoom/Live Action Item Extractor", layout="centered")
 st.title("🎙️ Zoom or Live → Action Items Extractor")
 
 st.markdown("""
@@ -21,18 +24,15 @@ Upload your **Zoom MP4** or **record live** using mic. This app will:
 3. Give you a downloadable JSON
 """)
 
-# Whisper model loader
 @st.cache_resource
 def load_model():
     return whisper.load_model("base")
 
-# Transcribe audio
 def transcribe_audio(file_path):
     model = load_model()
     result = model.transcribe(file_path)
     return result["text"]
 
-# GPT summarizer
 def summarize_to_action_items(transcript):
     prompt = f"""
 You are an expert meeting assistant. Based on the following transcript, extract all action items in structured JSON format.
@@ -57,29 +57,57 @@ Return only a JSON array like:
     )
     return response['choices'][0]['message']['content']
 
-# Audio input method
+# Input mode selection
 mode = st.radio("Select Input Mode", ["📤 Upload Zoom MP4", "🎤 Record Live Audio"])
-
-audio_bytes = None
 uploaded_file = None
+audio_file_path = None
 
+# Zoom Upload Mode
 if mode == "📤 Upload Zoom MP4":
-    uploaded_file = st.file_uploader("Upload MP4", type=["mp4"])
+    uploaded_file = st.file_uploader("Upload your Zoom MP4 file", type=["mp4"])
+    if uploaded_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(uploaded_file.read())
+            audio_file_path = tmp.name
+
+# Live Audio Recorder Mode
 elif mode == "🎤 Record Live Audio":
-    from streamlit_audiorecorder import audiorecorder
-    st.info("Click to record your meeting audio.")
-    audio_bytes = audiorecorder("🔴 Start Recording", "⏹️ Stop Recording")
+    class AudioProcessor:
+        def __init__(self):
+            self.frames = []
 
-if uploaded_file or (audio_bytes and len(audio_bytes) > 0):
-    with st.spinner("🔄 Processing audio..."):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4" if uploaded_file else ".wav") as tmp:
-            if uploaded_file:
-                tmp.write(uploaded_file.read())
-            else:
-                tmp.write(audio_bytes)
-            temp_path = tmp.name
+        def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+            self.frames.append(frame.to_ndarray())
+            return frame
 
-        transcript = transcribe_audio(temp_path)
+    st.info("Click Start to record your voice, then Stop and press Save & Transcribe.")
+    processor = AudioProcessor()
+    ctx = webrtc_streamer(
+        key="audio",
+        mode=WebRtcMode.SENDONLY,
+        in_audio=True,
+        audio_processor_factory=lambda: processor,
+        client_settings=ClientSettings(media_stream_constraints={"audio": True, "video": False}),
+    )
+
+    if st.button("🛑 Save & Transcribe"):
+        if processor.frames:
+            audio_data = np.concatenate(processor.frames, axis=1).flatten()
+            temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            with wave.open(temp_audio_file.name, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(48000)
+                wf.writeframes(audio_data.tobytes())
+            st.success("🎧 Audio recorded!")
+            audio_file_path = temp_audio_file.name
+        else:
+            st.warning("🎙️ No audio detected. Please record something.")
+
+# Process if audio file exists
+if audio_file_path:
+    with st.spinner("Transcribing and summarizing..."):
+        transcript = transcribe_audio(audio_file_path)
         st.success("✅ Transcription complete!")
         st.text_area("📝 Transcript Preview", transcript[:1000] + ("..." if len(transcript) > 1000 else ""), height=200)
 
@@ -90,7 +118,7 @@ if uploaded_file or (audio_bytes and len(audio_bytes) > 0):
             st.json(action_items)
 
             st.download_button(
-                label="📥 Download JSON",
+                label="📥 Download Action Items JSON",
                 data=json.dumps(action_items, indent=4),
                 file_name="action_items.json",
                 mime="application/json"
